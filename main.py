@@ -27,6 +27,14 @@ async def test_db():
 
 @app.post("/users")
 async def create_user(user: dict):
+
+    existing_user = await db.users.find_one(
+        {"email": user["email"]}
+    )
+
+    if existing_user:
+        return {"message": "User already exists"}
+
     result = await db.users.insert_one(user)
 
     return {
