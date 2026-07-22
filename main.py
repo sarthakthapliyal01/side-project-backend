@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from database import db
+from database import db, meta_db, client
+
 
 app = FastAPI()
 
@@ -15,10 +16,6 @@ app.add_middleware(
 @app.get("/")
 def root():
     return {"message": "Backend is working"}
-
-@app.get("/api/message")
-def get_message():
-    return {"message": "Hello from FastAPI"}
 
 @app.get("/test-db")
 async def test_db():
@@ -51,3 +48,30 @@ async def get_users():
         users.append(user)
 
     return users
+
+@app.post("/companies")
+async def create_company(company: dict):
+
+    existing_company = await meta_db.companies.find_one(
+        {"companyName": company["companyName"]}
+    )
+
+    print("Searching for:", company["companyName"])
+    print("Found:", existing_company)
+
+    if existing_company:
+        return {"message": "Company already exists"}
+
+    result = await meta_db.companies.insert_one(company)
+
+    database_name = company["companyName"].lower().replace(" ", "_")
+    tenant_db = client[database_name]
+
+    print("Creating tenant DB:", company["companyName"])
+
+    await tenant_db.company.insert_one(company)
+
+    return {
+        "message": "Company created",
+        "id": str(result.inserted_id)
+    }
