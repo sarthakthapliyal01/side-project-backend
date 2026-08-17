@@ -22,20 +22,20 @@ class ReleaseInfo(BaseModel):
 
 
 class Sprint(BaseModel):
-    sprintId: int
+    sprintId: Any
     name: str
     state: Optional[str] = None  # active, closed, future
-    boardId: Optional[int] = None
-    boardObjectId: Optional[str] = None
-    projectId: Optional[str] = None
+    boardId: Optional[Any] = None
+    boardObjectId: Optional[Any] = None
+    projectId: Optional[Any] = None
     projectKey: Optional[str] = None
-    companyId: Optional[str] = None
+    companyId: Optional[Any] = None
     companyName: Optional[str] = None
     projectKeyId: Optional[int] = None
     iterations: List[str] = []
     githubProjectV2IterationId: Optional[str] = None
-    originBoardId: Optional[int] = None
-    boardReference: Optional[int] = None
+    originBoardId: Optional[Any] = None
+    boardReference: Optional[Any] = None
     totalStoryPoints: Optional[float] = 0.0
     committedVsCompletedMetrics: Optional[CommittedVsCompletedMetrics] = None
     idealBurnupByDev: List[DevBurnupEstimate] = []
@@ -60,14 +60,14 @@ class StatusType(BaseModel):
 
 
 class SprintIssue(BaseModel):
-    issueId: int
+    issueId: Any
     key: str
     summary: str
     sprintId: List[Any] = []
-    boardId: Optional[int] = None
-    projectId: Optional[str] = None
+    boardId: Optional[Any] = None
+    projectId: Optional[Any] = None
     projectKey: Optional[str] = None
-    companyId: Optional[str] = None
+    companyId: Optional[Any] = None
     companyName: Optional[str] = None
     originalEstimateHrs: Optional[float] = 0.0
     developer: List[str] = []

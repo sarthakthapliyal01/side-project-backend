@@ -1,9 +1,9 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Any
 
 
 class BoardLocation(BaseModel):
-    projectId: Optional[int] = None
+    projectId: Optional[Any] = None
     projectName: Optional[str] = None
     projectKey: Optional[str] = None
     projectTypeKey: Optional[str] = None
@@ -16,9 +16,11 @@ class BoardLocation(BaseModel):
 
 
 class Board(BaseModel):
-    boardId: int
+    boardId: Any
     boardName: str
     boardType: str
+    companyId: Optional[Any] = None
+    projectId: Optional[Any] = None
 
     boardSelf: Optional[str] = None
     isPrivate: bool = False
