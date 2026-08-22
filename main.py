@@ -4,7 +4,7 @@ from database import db, meta_db, client, MONGO_URL
 import httpx
 import re
 from pydantic import BaseModel, EmailStr
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from bson import ObjectId
 from models.board import Board
@@ -463,7 +463,7 @@ async def sync_jira_sprints(company_name: str, board_id: Optional[int] = None):
 
 # 4. Modular Endpoint: Sync Sprint Issues
 @app.post("/jira/sync-sprint-issues/{company_name}/{sprint_id}")
-async def sync_jira_sprint_issues(company_name: str, sprint_id: int):
+async def sync_jira_sprint_issues(company_name: str, sprint_id: str):
     tenant_db = get_tenant_db(company_name)
     company_doc = await meta_db.companies.find_one({"companyName": company_name})
     if not company_doc:
@@ -475,7 +475,11 @@ async def sync_jira_sprint_issues(company_name: str, sprint_id: int):
         })
     company_id = to_object_id(company_doc["_id"]) if company_doc and "_id" in company_doc else None
 
-    sprint_doc = await tenant_db.sprints.find_one({"$or": [{"sprintId": sprint_id}, {"sprintId": str(sprint_id)}]})
+    possible_s_ids = [sprint_id]
+    if str(sprint_id).isdigit():
+        possible_s_ids.append(int(sprint_id))
+
+    sprint_doc = await tenant_db.sprints.find_one({"$or": [{"sprintId": {"$in": possible_s_ids}}, {"name": sprint_id}]})
     sprint_mongo_id = to_object_id(sprint_doc["_id"]) if sprint_doc else None
     board_mongo_id = to_object_id(sprint_doc.get("boardId")) if sprint_doc else None
     project_mongo_id = to_object_id(sprint_doc.get("projectId")) if sprint_doc else None
@@ -494,6 +498,14 @@ async def sync_jira_sprint_issues(company_name: str, sprint_id: int):
         response = await httpx_client.get(url, auth=auth, headers=headers)
 
     if response.status_code != 200:
+        # Fallback if sprint_id in Jira endpoint requires integer
+        if not str(sprint_id).isdigit() and sprint_doc and sprint_doc.get("sprintId"):
+            alt_sid = sprint_doc.get("sprintId")
+            url = f"https://{jira_host}.atlassian.net/rest/agile/1.0/sprint/{alt_sid}/issue"
+            async with httpx.AsyncClient() as httpx_client:
+                response = await httpx_client.get(url, auth=auth, headers=headers)
+
+    if response.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Failed to fetch issues for sprint {sprint_id}")
 
     issues_data = response.json().get("issues", [])
@@ -508,11 +520,34 @@ async def sync_jira_sprint_issues(company_name: str, sprint_id: int):
         issue_project = fields.get("project", {})
         issue_project_key = issue_project.get("key") or project_key
 
-        story_points = fields.get("customfield_10016") or fields.get("customfield_10026") or 0.0
+        story_points = 0.0
+        for cf_key in ["customfield_10016", "customfield_10026", "customfield_10002", "customfield_10004", "customfield_10024", "customfield_10028", "customfield_10030", "storyPoints"]:
+            if fields.get(cf_key) is not None:
+                try:
+                    story_points = float(fields.get(cf_key))
+                    break
+                except (ValueError, TypeError):
+                    pass
 
         timetracking = fields.get("timetracking", {})
-        original_estimate_hrs = (timetracking.get("originalEstimateSeconds", 0) or 0) / 3600.0
-        time_spent_hrs = (timetracking.get("timespentSeconds", 0) or 0) / 3600.0
+        orig_sec = (
+            fields.get("timeoriginalestimate") or
+            fields.get("aggregatetimeoriginalestimate") or
+            timetracking.get("originalEstimateSeconds") or
+            0
+        )
+        spent_sec = (
+            fields.get("timespent") or
+            fields.get("aggregatetimespent") or
+            timetracking.get("timeSpentSeconds") or
+            0
+        )
+
+        original_estimate_hrs = float(orig_sec) / 3600.0 if orig_sec else 0.0
+        time_spent_hrs = float(spent_sec) / 3600.0 if spent_sec else 0.0
+
+        if original_estimate_hrs == 0.0 and story_points > 0:
+            original_estimate_hrs = story_points * 8.0
 
         assignee_data = fields.get("assignee")
         assignee_name = assignee_data.get("displayName") if assignee_data else None
@@ -521,9 +556,9 @@ async def sync_jira_sprint_issues(company_name: str, sprint_id: int):
         status_data = fields.get("status", {})
         priority_data = fields.get("priority", {})
 
-        created_dt = datetime.fromisoformat(fields["created"].replace("Z", "+00:00")) if fields.get("created") else None
-        updated_dt = datetime.fromisoformat(fields["updated"].replace("Z", "+00:00")) if fields.get("updated") else None
-        duedate_dt = datetime.fromisoformat(fields["duedate"]) if fields.get("duedate") else None
+        created_dt = parse_dt(fields.get("created"))
+        updated_dt = parse_dt(fields.get("updated"))
+        duedate_dt = parse_dt(fields.get("duedate"))
 
         labels = fields.get("labels", [])
         fix_versions = [v.get("name") for v in fields.get("fixVersions", [])]
@@ -534,6 +569,8 @@ async def sync_jira_sprint_issues(company_name: str, sprint_id: int):
         if sprint_id is not None:
             sprint_id_list.append(sprint_id)
             sprint_id_list.append(str(sprint_id))
+            if str(sprint_id).isdigit():
+                sprint_id_list.append(int(sprint_id))
 
         issue_doc = {
             "issueId": issue_id,
@@ -582,6 +619,7 @@ async def sync_jira_sprint_issues(company_name: str, sprint_id: int):
 
 # ORCHESTRATED UNIFIED SYNC: Calls sync_jira_projects, sync_jira_boards, sync_jira_sprints, & sync_jira_sprint_issues sequentially
 @app.post("/jira/sync-all/{company_name}")
+@app.post("/sync-all/{company_name}")
 async def sync_all_jira_data(company_name: str):
     tenant_db = get_tenant_db(company_name)
 
@@ -614,21 +652,22 @@ async def sync_all_jira_data(company_name: str):
             # 4. Sync Sprint Issues for each synced sprint
             sprints = await tenant_db.sprints.find().to_list(None)
             for sprint in sprints:
-                if "sprintId" in sprint and sprint["sprintId"]:
+                sid = sprint.get("sprintId") or sprint.get("id")
+                if sid is not None and str(sid).strip():
                     try:
-                        iss_res = await sync_jira_sprint_issues(company_name, int(sprint["sprintId"]))
+                        iss_res = await sync_jira_sprint_issues(company_name, str(sid))
                         total_issues += iss_res.get("totalSynced", 0)
                     except Exception as e:
-                        print(f"Error syncing issues for sprint {sprint.get('sprintId')}: {e}")
+                        print(f"Error syncing issues for sprint {sid}: {e}")
         except Exception as e:
             print(f"Error syncing Jira data: {e}")
 
     if github_conn:
-        # 5. Sync GitHub PRs if GitHub integration exists
+        # 5. Sync GitHub Repos & PRs if GitHub integration exists
         try:
-            await sync_github_prs(company_name)
+            await sync_all_github_data(company_name)
         except Exception as e:
-            print(f"Error syncing GitHub PRs in sync-all: {e}")
+            print(f"Error syncing GitHub data in sync-all: {e}")
 
     return {
         "message": "Data synced successfully",
@@ -712,11 +751,46 @@ async def get_jira_sprints(company_name: str, project_id: str = None):
     return {"sprints": all_sprints}
 
 @app.get("/jira/db-sprints/{company_name}")
-async def get_db_sprints(company_name: str, board_id: Optional[int] = None):
+async def get_db_sprints(company_name: str, board_id: Optional[str] = None, project_id: Optional[str] = None):
     tenant_db = get_tenant_db(company_name)
     query = {}
-    if board_id:
-        query["boardId"] = board_id
+    target_pid = project_id or board_id
+    if target_pid:
+        possible_ids = [target_pid]
+        if str(target_pid).isdigit():
+            possible_ids.append(int(target_pid))
+        obj_id = to_object_id(target_pid)
+        if obj_id:
+            possible_ids.append(obj_id)
+
+        or_proj_lookup = [
+            {"projectId": str(target_pid)},
+            {"projectKey": str(target_pid)},
+            {"projectName": str(target_pid)}
+        ]
+        if str(target_pid).isdigit():
+            or_proj_lookup.append({"projectId": int(target_pid)})
+
+        proj_doc = await tenant_db.projects.find_one({"$or": or_proj_lookup})
+        project_keys = [str(target_pid)]
+        if proj_doc:
+            if "_id" in proj_doc:
+                possible_ids.append(proj_doc["_id"])
+                possible_ids.append(str(proj_doc["_id"]))
+            if proj_doc.get("projectId"):
+                possible_ids.append(proj_doc["projectId"])
+                possible_ids.append(str(proj_doc["projectId"]))
+                if str(proj_doc["projectId"]).isdigit():
+                    possible_ids.append(int(proj_doc["projectId"]))
+            if proj_doc.get("projectKey"):
+                project_keys.append(proj_doc["projectKey"])
+
+        query["$or"] = [
+            {"projectId": {"$in": possible_ids}},
+            {"projectKey": {"$in": project_keys}},
+            {"boardId": {"$in": possible_ids}},
+            {"originBoardId": {"$in": possible_ids}}
+        ]
 
     sprints = await tenant_db.sprints.find(query).to_list(None)
     sprints_list = [sanitize_doc(s) for s in sprints]
@@ -725,7 +799,7 @@ async def get_db_sprints(company_name: str, board_id: Optional[int] = None):
 @app.get("/jira/db-sprint-issues/{company_name}")
 async def get_db_sprint_issues(company_name: str, sprint_id: Optional[str] = None, project_id: Optional[str] = None):
     tenant_db = get_tenant_db(company_name)
-    query = {}
+    and_conditions = []
 
     if sprint_id:
         possible_sprint_ids = [sprint_id]
@@ -756,7 +830,7 @@ async def get_db_sprint_issues(company_name: str, sprint_id: Optional[str] = Non
                 except (ValueError, TypeError):
                     pass
 
-        query["sprintId"] = {"$in": possible_sprint_ids}
+        and_conditions.append({"sprintId": {"$in": possible_sprint_ids}})
 
     if project_id:
         possible_proj_ids = [project_id]
@@ -766,20 +840,392 @@ async def get_db_sprint_issues(company_name: str, sprint_id: Optional[str] = Non
         if obj_p:
             possible_proj_ids.append(obj_p)
 
-        proj_doc = await tenant_db.projects.find_one({"$or": [
+        or_proj_lookup = [
             {"projectId": str(project_id)},
             {"projectKey": str(project_id)},
             {"projectName": str(project_id)}
-        ]})
-        if proj_doc and "_id" in proj_doc:
-            possible_proj_ids.append(proj_doc["_id"])
-            possible_proj_ids.append(str(proj_doc["_id"]))
+        ]
+        if str(project_id).isdigit():
+            or_proj_lookup.append({"projectId": int(project_id)})
 
-        query["projectId"] = {"$in": possible_proj_ids}
+        proj_doc = await tenant_db.projects.find_one({"$or": or_proj_lookup})
+        project_keys = [str(project_id)]
+
+        if proj_doc:
+            if "_id" in proj_doc:
+                possible_proj_ids.append(proj_doc["_id"])
+                possible_proj_ids.append(str(proj_doc["_id"]))
+            if proj_doc.get("projectId"):
+                possible_proj_ids.append(proj_doc["projectId"])
+                possible_proj_ids.append(str(proj_doc["projectId"]))
+                if str(proj_doc["projectId"]).isdigit():
+                    possible_proj_ids.append(int(proj_doc["projectId"]))
+            if proj_doc.get("projectKey"):
+                project_keys.append(proj_doc["projectKey"])
+
+        and_conditions.append({
+            "$or": [
+                {"projectId": {"$in": possible_proj_ids}},
+                {"projectKey": {"$in": project_keys}}
+            ]
+        })
+
+    query = {}
+    if and_conditions:
+        if len(and_conditions) == 1:
+            query = and_conditions[0]
+        else:
+            query = {"$and": and_conditions}
 
     issues = await tenant_db.sprint_issues.find(query).to_list(None)
+
     issues_list = [sanitize_doc(issue) for issue in issues]
     return {"issues": issues_list}
+
+
+def parse_dt(val):
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, str):
+        val_str = val.strip()
+        try:
+            return datetime.fromisoformat(val_str.replace("Z", "+00:00"))
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(val_str, fmt)
+            except Exception:
+                pass
+    return None
+
+
+@app.get("/jira/burndown/{company_name}")
+async def get_jira_burndown(company_name: str, sprint_id: Optional[str] = None, project_id: Optional[str] = None):
+    tenant_db = get_tenant_db(company_name)
+
+    sprint_doc = None
+    if sprint_id:
+        or_conditions = [
+            {"sprintId": int(sprint_id) if str(sprint_id).isdigit() else sprint_id},
+            {"sprintId": str(sprint_id)},
+            {"name": sprint_id},
+            {"name": {"$regex": f"^{re.escape(str(sprint_id))}$", "$options": "i"}}
+        ]
+        obj_s = to_object_id(sprint_id)
+        if obj_s:
+            or_conditions.append({"_id": obj_s})
+        sprint_doc = await tenant_db.sprints.find_one({"$or": or_conditions})
+    
+    if not sprint_doc:
+        query = {}
+        if project_id:
+            possible_pids = [project_id]
+            if str(project_id).isdigit():
+                possible_pids.append(int(project_id))
+            query["$or"] = [{"projectId": {"$in": possible_pids}}, {"projectKey": project_id}]
+        sprint_doc = await tenant_db.sprints.find_one(query, sort=[("createdAt", -1)])
+
+    issues = []
+    possible_sprint_ids = []
+    if sprint_doc:
+        sid = sprint_doc.get("sprintId")
+        if sid:
+            possible_sprint_ids.extend([sid, str(sid)])
+            if str(sid).isdigit():
+                possible_sprint_ids.append(int(sid))
+        if "_id" in sprint_doc:
+            possible_sprint_ids.extend([sprint_doc["_id"], str(sprint_doc["_id"])])
+
+    if possible_sprint_ids:
+        issues = await tenant_db.sprint_issues.find({"sprintId": {"$in": possible_sprint_ids}}).to_list(None)
+    elif sprint_id or project_id:
+        issues_res = await get_db_sprint_issues(company_name, sprint_id=sprint_id, project_id=project_id)
+        issues = issues_res.get("issues", [])
+
+    start_dt = parse_dt(sprint_doc.get("startDate")) if sprint_doc else None
+    end_dt = parse_dt(sprint_doc.get("endDate")) if sprint_doc else None
+
+    if not start_dt:
+        start_dt = datetime.utcnow() - timedelta(days=5)
+    if not end_dt:
+        end_dt = start_dt + timedelta(days=10)
+
+    num_days = max(2, (end_dt.date() - start_dt.date()).days + 1)
+    dates_list = [start_dt.date() + timedelta(days=i) for i in range(num_days)]
+    date_labels = [d.strftime("%m/%d") for d in dates_list]
+    is_weekend_list = [d.weekday() in (5, 6) for d in dates_list]
+
+    working_days_count = sum(1 for is_w in is_weekend_list if not is_w)
+    if working_days_count == 0:
+        working_days_count = num_days
+
+    total_sp = sum(float(i.get("storyPoints") or 0) for i in issues)
+    total_hrs = sum(
+        float(i.get("originalEstimateHrs") or i.get("timeSpentHrs") or (float(i.get("storyPoints") or 0) * 8.0))
+        for i in issues
+    )
+
+    ideal_sp_daily = total_sp / max(1, working_days_count)
+    ideal_hrs_daily = total_hrs / max(1, working_days_count)
+
+    ideal_sp = []
+    ideal_hrs = []
+    curr_sp = total_sp
+    curr_hrs = total_hrs
+
+    for idx, d in enumerate(dates_list):
+        if idx == 0:
+            ideal_sp.append(round(curr_sp, 1))
+            ideal_hrs.append(round(curr_hrs, 1))
+        elif idx == num_days - 1:
+            ideal_sp.append(0.0)
+            ideal_hrs.append(0.0)
+        else:
+            prev_date = dates_list[idx - 1]
+            if prev_date.weekday() not in (5, 6):
+                curr_sp = max(0.0, curr_sp - ideal_sp_daily)
+                curr_hrs = max(0.0, curr_hrs - ideal_hrs_daily)
+            ideal_sp.append(round(max(0.0, curr_sp), 1))
+            ideal_hrs.append(round(max(0.0, curr_hrs), 1))
+
+    today_date = datetime.utcnow().date()
+    daily_closed_sp = {d: 0.0 for d in dates_list}
+    daily_closed_hrs = {d: 0.0 for d in dates_list}
+
+    for issue in issues:
+        st = issue.get("status")
+        st_name = (st.get("name") if isinstance(st, dict) else str(st or "")).lower()
+        is_closed = any(kw in st_name for kw in ["close", "done", "resolve", "complete"])
+        
+        if is_closed:
+            sp_val = float(issue.get("storyPoints") or 0)
+            hrs_val = float(issue.get("originalEstimateHrs") or issue.get("timeSpentHrs") or (sp_val * 8.0))
+            
+            comp_dt = parse_dt(issue.get("workCompletedAt") or issue.get("issueUpdatedAt") or issue.get("updatedAt"))
+            c_date = comp_dt.date() if comp_dt else start_dt.date()
+            if c_date < dates_list[0]:
+                c_date = dates_list[0]
+            elif c_date > dates_list[-1]:
+                c_date = dates_list[-1]
+            
+            daily_closed_sp[c_date] = daily_closed_sp.get(c_date, 0.0) + sp_val
+            daily_closed_hrs[c_date] = daily_closed_hrs.get(c_date, 0.0) + hrs_val
+
+    actual_sp = []
+    actual_hrs = []
+    cum_closed_sp = 0.0
+    cum_closed_hrs = 0.0
+
+    for d in dates_list:
+        if d <= today_date:
+            cum_closed_sp += daily_closed_sp.get(d, 0.0)
+            cum_closed_hrs += daily_closed_hrs.get(d, 0.0)
+            actual_sp.append(round(max(0.0, total_sp - cum_closed_sp), 1))
+            actual_hrs.append(round(max(0.0, total_hrs - cum_closed_hrs), 1))
+        else:
+            actual_sp.append(None)
+            actual_hrs.append(None)
+
+    last_5_sprints = await tenant_db.sprints.find().sort("createdAt", -1).limit(5).to_list(None)
+    five_spts_sp_sum = sum(float(s.get("totalStoryPoints") or 0) for s in last_5_sprints)
+    five_spts_sp_avg = round(five_spts_sp_sum / max(1, len(last_5_sprints)), 1)
+    five_spts_hrs_avg = round(five_spts_sp_avg * 8, 1)
+
+    yesterday_date = today_date - timedelta(days=1)
+
+    return {
+        "sprintName": sprint_doc.get("name", "Current Sprint") if sprint_doc else "Current Sprint",
+        "startDate": start_dt.isoformat(),
+        "endDate": end_dt.isoformat(),
+        "dates": date_labels,
+        "isWeekend": is_weekend_list,
+        "sp": {
+            "todaysBurned": round(daily_closed_sp.get(today_date, 0.0), 1),
+            "yesterdaysBurned": round(daily_closed_sp.get(yesterday_date, 0.0), 1),
+            "target": round(ideal_sp_daily, 1),
+            "compleTT": round(cum_closed_sp, 1),
+            "fiveSptsAvg": five_spts_sp_avg,
+            "total": round(total_sp, 1),
+            "ideal": ideal_sp,
+            "actual": actual_sp,
+        },
+        "hrs": {
+            "todaysBurned": round(daily_closed_hrs.get(today_date, 0.0), 1),
+            "yesterdaysBurned": round(daily_closed_hrs.get(yesterday_date, 0.0), 1),
+            "target": round(ideal_hrs_daily, 1),
+            "compleTT": round(cum_closed_hrs, 1),
+            "fiveSptsAvg": five_spts_hrs_avg,
+            "total": round(total_hrs, 1),
+            "ideal": ideal_hrs,
+            "actual": actual_hrs,
+        }
+    }
+
+
+@app.get("/jira/burnup/{company_name}")
+async def get_jira_burnup(company_name: str, sprint_id: Optional[str] = None, project_id: Optional[str] = None):
+    tenant_db = get_tenant_db(company_name)
+
+    sprint_doc = None
+    if sprint_id:
+        or_conditions = [
+            {"sprintId": int(sprint_id) if str(sprint_id).isdigit() else sprint_id},
+            {"sprintId": str(sprint_id)},
+            {"name": sprint_id},
+            {"name": {"$regex": f"^{re.escape(str(sprint_id))}$", "$options": "i"}}
+        ]
+        obj_s = to_object_id(sprint_id)
+        if obj_s:
+            or_conditions.append({"_id": obj_s})
+        sprint_doc = await tenant_db.sprints.find_one({"$or": or_conditions})
+    
+    if not sprint_doc:
+        query = {}
+        if project_id:
+            possible_pids = [project_id]
+            if str(project_id).isdigit():
+                possible_pids.append(int(project_id))
+            query["$or"] = [{"projectId": {"$in": possible_pids}}, {"projectKey": project_id}]
+        sprint_doc = await tenant_db.sprints.find_one(query, sort=[("createdAt", -1)])
+
+    issues = []
+    possible_sprint_ids = []
+    if sprint_doc:
+        sid = sprint_doc.get("sprintId")
+        if sid:
+            possible_sprint_ids.extend([sid, str(sid)])
+            if str(sid).isdigit():
+                possible_sprint_ids.append(int(sid))
+        if "_id" in sprint_doc:
+            possible_sprint_ids.extend([sprint_doc["_id"], str(sprint_doc["_id"])])
+
+    if possible_sprint_ids:
+        issues = await tenant_db.sprint_issues.find({"sprintId": {"$in": possible_sprint_ids}}).to_list(None)
+    elif sprint_id or project_id:
+        issues_res = await get_db_sprint_issues(company_name, sprint_id=sprint_id, project_id=project_id)
+        issues = issues_res.get("issues", [])
+
+    start_dt = parse_dt(sprint_doc.get("startDate")) if sprint_doc else None
+    end_dt = parse_dt(sprint_doc.get("endDate")) if sprint_doc else None
+
+    if not start_dt:
+        start_dt = datetime.utcnow() - timedelta(days=5)
+    if not end_dt:
+        end_dt = start_dt + timedelta(days=10)
+
+    num_days = max(2, (end_dt.date() - start_dt.date()).days + 1)
+    dates_list = [start_dt.date() + timedelta(days=i) for i in range(num_days)]
+    date_labels = [d.strftime("%m/%d") for d in dates_list]
+    is_weekend_list = [d.weekday() in (5, 6) for d in dates_list]
+
+    working_days_count = sum(1 for is_w in is_weekend_list if not is_w)
+    if working_days_count == 0:
+        working_days_count = num_days
+
+    total_sp = sum(float(i.get("storyPoints") or 0) for i in issues)
+    total_hrs = sum(
+        float(i.get("originalEstimateHrs") or i.get("timeSpentHrs") or (float(i.get("storyPoints") or 0) * 8.0))
+        for i in issues
+    )
+
+    ideal_sp_daily = total_sp / max(1, working_days_count)
+    ideal_hrs_daily = total_hrs / max(1, working_days_count)
+
+    ideal_sp = []
+    ideal_hrs = []
+    curr_sp = 0.0
+    curr_hrs = 0.0
+
+    for idx, d in enumerate(dates_list):
+        if idx == 0:
+            ideal_sp.append(0.0)
+            ideal_hrs.append(0.0)
+        elif idx == num_days - 1:
+            ideal_sp.append(round(total_sp, 1))
+            ideal_hrs.append(round(total_hrs, 1))
+        else:
+            prev_date = dates_list[idx - 1]
+            if prev_date.weekday() not in (5, 6):
+                curr_sp = min(total_sp, curr_sp + ideal_sp_daily)
+                curr_hrs = min(total_hrs, curr_hrs + ideal_hrs_daily)
+            ideal_sp.append(round(min(total_sp, curr_sp), 1))
+            ideal_hrs.append(round(min(total_hrs, curr_hrs), 1))
+
+    today_date = datetime.utcnow().date()
+    daily_closed_sp = {d: 0.0 for d in dates_list}
+    daily_closed_hrs = {d: 0.0 for d in dates_list}
+
+    for issue in issues:
+        st = issue.get("status")
+        st_name = (st.get("name") if isinstance(st, dict) else str(st or "")).lower()
+        is_closed = any(kw in st_name for kw in ["close", "done", "resolve", "complete"])
+        
+        if is_closed:
+            sp_val = float(issue.get("storyPoints") or 0)
+            hrs_val = float(issue.get("originalEstimateHrs") or issue.get("timeSpentHrs") or (sp_val * 8.0))
+            
+            comp_dt = parse_dt(issue.get("workCompletedAt") or issue.get("issueUpdatedAt") or issue.get("updatedAt"))
+            c_date = comp_dt.date() if comp_dt else start_dt.date()
+            if c_date < dates_list[0]:
+                c_date = dates_list[0]
+            elif c_date > dates_list[-1]:
+                c_date = dates_list[-1]
+            
+            daily_closed_sp[c_date] = daily_closed_sp.get(c_date, 0.0) + sp_val
+            daily_closed_hrs[c_date] = daily_closed_hrs.get(c_date, 0.0) + hrs_val
+
+    actual_sp = []
+    actual_hrs = []
+    cum_closed_sp = 0.0
+    cum_closed_hrs = 0.0
+
+    for d in dates_list:
+        if d <= today_date:
+            cum_closed_sp += daily_closed_sp.get(d, 0.0)
+            cum_closed_hrs += daily_closed_hrs.get(d, 0.0)
+            actual_sp.append(round(min(total_sp, cum_closed_sp), 1))
+            actual_hrs.append(round(min(total_hrs, cum_closed_hrs), 1))
+        else:
+            actual_sp.append(None)
+            actual_hrs.append(None)
+
+    last_5_sprints = await tenant_db.sprints.find().sort("createdAt", -1).limit(5).to_list(None)
+    five_spts_sp_sum = sum(float(s.get("totalStoryPoints") or 0) for s in last_5_sprints)
+    five_spts_sp_avg = round(five_spts_sp_sum / max(1, len(last_5_sprints)), 1)
+    five_spts_hrs_avg = round(five_spts_sp_avg * 8, 1)
+
+    yesterday_date = today_date - timedelta(days=1)
+
+    return {
+        "sprintName": sprint_doc.get("name", "Current Sprint") if sprint_doc else "Current Sprint",
+        "startDate": start_dt.isoformat(),
+        "endDate": end_dt.isoformat(),
+        "dates": date_labels,
+        "isWeekend": is_weekend_list,
+        "sp": {
+            "todaysBurned": round(daily_closed_sp.get(today_date, 0.0), 1),
+            "yesterdaysBurned": round(daily_closed_sp.get(yesterday_date, 0.0), 1),
+            "target": round(ideal_sp_daily, 1),
+            "compleTT": round(cum_closed_sp, 1),
+            "fiveSptsAvg": five_spts_sp_avg,
+            "total": round(total_sp, 1),
+            "ideal": ideal_sp,
+            "actual": actual_sp,
+        },
+        "hrs": {
+            "todaysBurned": round(daily_closed_hrs.get(today_date, 0.0), 1),
+            "yesterdaysBurned": round(daily_closed_hrs.get(yesterday_date, 0.0), 1),
+            "target": round(ideal_hrs_daily, 1),
+            "compleTT": round(cum_closed_hrs, 1),
+            "fiveSptsAvg": five_spts_hrs_avg,
+            "total": round(total_hrs, 1),
+            "ideal": ideal_hrs,
+            "actual": actual_hrs,
+        }
+    }
 
 
 # ==============================================================================
@@ -802,21 +1248,40 @@ async def test_github_connection(data: GitHubConnectionRequest):
         "Accept": "application/vnd.github+json"
     }
     async with httpx.AsyncClient() as httpx_client:
-        response = await httpx_client.get(
-            f"https://api.github.com/users/{data.github_owner}",
-            headers=headers
-        )
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid GitHub owner or Personal Access Token"
-        )
-    owner = response.json()
-    return {
-        "connected": True,
-        "owner": owner.get("login"),
-        "type": owner.get("type")
-    }
+        # First check authenticated user
+        user_res = await httpx_client.get("https://api.github.com/user", headers=headers)
+        if user_res.status_code == 200:
+            user_data = user_res.json()
+            return {
+                "connected": True,
+                "owner": user_data.get("login"),
+                "type": user_data.get("type", "User")
+            }
+        
+        # Next check users endpoint
+        u_res = await httpx_client.get(f"https://api.github.com/users/{data.github_owner}", headers=headers)
+        if u_res.status_code == 200:
+            u_data = u_res.json()
+            return {
+                "connected": True,
+                "owner": u_data.get("login"),
+                "type": u_data.get("type")
+            }
+
+        # Next check orgs endpoint
+        org_res = await httpx_client.get(f"https://api.github.com/orgs/{data.github_owner}", headers=headers)
+        if org_res.status_code == 200:
+            org_data = org_res.json()
+            return {
+                "connected": True,
+                "owner": org_data.get("login"),
+                "type": "Organization"
+            }
+
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid GitHub owner or Personal Access Token"
+    )
 
 @app.post("/github/save-connection")
 async def save_github_connection(data: SaveGitHubRequest):
@@ -834,13 +1299,7 @@ async def save_github_connection(data: SaveGitHubRequest):
         upsert=True
     )
 
-    # Immediately fetch & store repos and PRs in MongoDB upon connecting GitHub
-    try:
-        await sync_github_repos(data.companyName)
-    except Exception as e:
-        print(f"Error auto-syncing GitHub data on save-connection: {e}")
-
-    return {"message": "GitHub connection saved & PRs stored in MongoDB successfully"}
+    return {"message": "GitHub connection saved successfully"}
 
 @app.get("/github/connection/{company_name}")
 async def get_github_connection(company_name: str):
@@ -853,6 +1312,59 @@ async def get_github_connection(company_name: str):
         "github_owner": connection.get("github_owner")
     }
 
+async def fetch_github_repos_from_api(owner: str, token: str):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json"
+    }
+    all_repos = []
+    seen_ids = set()
+
+    async with httpx.AsyncClient() as httpx_client:
+        # 1. Fetch repos for authenticated user (includes private, internal, and org repos token has access to)
+        user_url = "https://api.github.com/user/repos?per_page=100&type=all&sort=updated"
+        res = await httpx_client.get(user_url, headers=headers)
+        if res.status_code == 200:
+            for r in res.json():
+                r_id = str(r.get("id"))
+                if r_id not in seen_ids:
+                    seen_ids.add(r_id)
+                    all_repos.append(r)
+
+        # 2. Try org repos if owner is specified
+        if owner:
+            org_url = f"https://api.github.com/orgs/{owner}/repos?per_page=100&type=all&sort=updated"
+            res_org = await httpx_client.get(org_url, headers=headers)
+            if res_org.status_code == 200:
+                for r in res_org.json():
+                    r_id = str(r.get("id"))
+                    if r_id not in seen_ids:
+                        seen_ids.add(r_id)
+                        all_repos.append(r)
+
+        # 3. Try users endpoint for public repos of owner
+        if owner:
+            users_url = f"https://api.github.com/users/{owner}/repos?per_page=100&sort=updated"
+            res_user = await httpx_client.get(users_url, headers=headers)
+            if res_user.status_code == 200:
+                for r in res_user.json():
+                    r_id = str(r.get("id"))
+                    if r_id not in seen_ids:
+                        seen_ids.add(r_id)
+                        all_repos.append(r)
+
+    if owner and all_repos:
+        owner_clean = owner.strip().lower()
+        matched = [
+            r for r in all_repos
+            if (r.get("owner", {}).get("login", "").lower() == owner_clean) or
+               (r.get("full_name", "").lower().startswith(f"{owner_clean}/"))
+        ]
+        if matched:
+            return matched
+
+    return all_repos
+
 @app.get("/github/repos/{company_name}")
 async def get_github_repos(company_name: str):
     tenant_db = get_tenant_db(company_name)
@@ -860,37 +1372,23 @@ async def get_github_repos(company_name: str):
     if not connection:
         return {"connected": False, "repos": []}
 
-    owner = connection.get("github_owner")
-    token = connection.get("github_token")
+    owner = connection.get("github_owner", "")
+    token = connection.get("github_token", "")
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json"
-    }
+    repos_data = await fetch_github_repos_from_api(owner, token)
 
-    async with httpx.AsyncClient() as httpx_client:
-        url = f"https://api.github.com/users/{owner}/repos?per_page=100"
-        res = await httpx_client.get(url, headers=headers)
-        if res.status_code != 200:
-            url = f"https://api.github.com/orgs/{owner}/repos?per_page=100"
-            res = await httpx_client.get(url, headers=headers)
-
-    if res.status_code == 200:
-        repos_data = res.json()
-        repos = [
-            {
-                "id": str(r.get("id")),
-                "name": r.get("name"),
-                "full_name": r.get("full_name"),
-                "html_url": r.get("html_url"),
-                "description": r.get("description"),
-                "is_private": r.get("private", False)
-            }
-            for r in repos_data
-        ]
-        return {"connected": True, "repos": repos}
-
-    return {"connected": True, "repos": []}
+    repos = [
+        {
+            "id": str(r.get("id")),
+            "name": r.get("name"),
+            "full_name": r.get("full_name"),
+            "html_url": r.get("html_url"),
+            "description": r.get("description"),
+            "is_private": r.get("private", False)
+        }
+        for r in repos_data
+    ]
+    return {"connected": True, "repos": repos}
 
 @app.post("/github/sync-repos/{company_name}")
 async def sync_github_repos(company_name: str):
@@ -899,33 +1397,21 @@ async def sync_github_repos(company_name: str):
     if not connection:
         raise HTTPException(status_code=404, detail="GitHub connection not found")
 
-    owner = connection.get("github_owner")
-    token = connection.get("github_token")
+    owner = connection.get("github_owner", "")
+    token = connection.get("github_token", "")
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json"
-    }
+    repos_data = await fetch_github_repos_from_api(owner, token)
+    if not repos_data:
+        return {"message": "No GitHub repositories found for this account", "totalSynced": 0}
 
-    async with httpx.AsyncClient() as httpx_client:
-        url = f"https://api.github.com/users/{owner}/repos?per_page=100"
-        res = await httpx_client.get(url, headers=headers)
-        if res.status_code != 200:
-            url = f"https://api.github.com/orgs/{owner}/repos?per_page=100"
-            res = await httpx_client.get(url, headers=headers)
-
-    if res.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to fetch GitHub repositories")
-
-    repos_data = res.json()
     synced_count = 0
-
     for r in repos_data:
+        r_owner = r.get("owner", {}).get("login") or owner
         repo_doc = {
             "repoId": str(r.get("id")),
             "name": r.get("name"),
             "fullName": r.get("full_name"),
-            "owner": owner,
+            "owner": r_owner,
             "htmlUrl": r.get("html_url"),
             "description": r.get("description"),
             "isPrivate": r.get("private", False),
@@ -938,13 +1424,17 @@ async def sync_github_repos(company_name: str):
         )
         synced_count += 1
 
-    # Automatically fetch and store PRs in MongoDB matching pullRequestSchema
-    try:
-        await sync_github_prs(company_name)
-    except Exception as e:
-        print(f"Auto PR sync error in sync_github_repos: {e}")
+    return {"message": "GitHub repositories synced successfully", "totalSynced": synced_count}
 
-    return {"message": "GitHub repositories and PRs synced successfully", "totalSynced": synced_count}
+@app.post("/github/sync-all/{company_name}")
+async def sync_all_github_data(company_name: str):
+    repos_res = await sync_github_repos(company_name)
+    prs_res = await sync_github_prs(company_name)
+    return {
+        "message": "GitHub repositories and PRs synced successfully",
+        "totalReposSynced": repos_res.get("totalSynced", 0),
+        "totalPRsSynced": prs_res.get("totalSynced", 0)
+    }
 
 @app.get("/github/db-repos/{company_name}")
 async def get_db_github_repos(company_name: str):
