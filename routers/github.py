@@ -153,26 +153,18 @@ async def fetch_github_repos_from_api(owner: str, token: str):
 @router.get("/github/repos/{company_name}")
 async def get_github_repos(company_name: str):
     tenant_db = get_tenant_db(company_name)
-    connection = await tenant_db.connections.find_one({"integrationType": "github"})
-    if not connection:
-        return {"connected": False, "repos": []}
+    repos = await tenant_db.github_repos.find().to_list(None)
 
-    owner = connection.get("github_owner", "")
-    token = connection.get("github_token", "")
+    # Fallback auto-sync if DB repos is empty
+    if not repos:
+        try:
+            await sync_github_repos(company_name)
+            repos = await tenant_db.github_repos.find().to_list(None)
+        except Exception as e:
+            print(f"On-demand GitHub repos sync error: {e}")
 
-    repos_data = await fetch_github_repos_from_api(owner, token)
-
-    repos = [
-        {
-            "id": str(r.get("id")),
-            "name": r.get("name"),
-            "full_name": r.get("full_name"),
-            "html_url": r.get("html_url"),
-            "description": r.get("description"),
-            "is_private": r.get("private", False)
-        }
-        for r in repos_data
-    ]
+    for r in repos:
+        r["_id"] = str(r["_id"])
     return {"connected": True, "repos": repos}
 
 
@@ -222,22 +214,6 @@ async def sync_all_github_data(company_name: str):
         "totalReposSynced": repos_res.get("totalSynced", 0),
         "totalPRsSynced": prs_res.get("totalSynced", 0)
     }
-
-
-@router.get("/github/db-repos/{company_name}")
-async def get_db_github_repos(company_name: str):
-    tenant_db = get_tenant_db(company_name)
-    repos = await tenant_db.github_repos.find().to_list(None)
-
-    # Fallback to live GitHub API if DB repos is empty
-    if not repos:
-        live_res = await get_github_repos(company_name)
-        live_repos = live_res.get("repos", [])
-        return {"repos": live_repos}
-
-    for r in repos:
-        r["_id"] = str(r["_id"])
-    return {"repos": repos}
 
 
 @router.get("/github/prs/{company_name}")

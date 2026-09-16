@@ -49,17 +49,22 @@ def sanitize_doc(doc: dict) -> dict:
 def parse_dt(val):
     if not val:
         return None
+    res = None
     if isinstance(val, datetime):
-        return val
-    if isinstance(val, str):
+        res = val
+    elif isinstance(val, str):
         val_str = val.strip()
         try:
-            return datetime.fromisoformat(val_str.replace("Z", "+00:00"))
+            res = datetime.fromisoformat(val_str.replace("Z", "+00:00"))
         except Exception:
             pass
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%Y-%m-%dT%H:%M:%S"):
-            try:
-                return datetime.strptime(val_str, fmt)
-            except Exception:
-                pass
-    return None
+        if not res:
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    res = datetime.strptime(val_str, fmt)
+                    break
+                except Exception:
+                    pass
+    if res and res.tzinfo is not None:
+        res = res.replace(tzinfo=None)
+    return res
