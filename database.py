@@ -4,7 +4,13 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
 
-MONGO_URL = os.getenv("MONGO_URL")
+MONGO_URL = (
+    os.getenv("MONGO_URL") or
+    os.getenv("mongodb_url") or
+    os.getenv("MONGODB_URL") or
+    os.getenv("MONGO_URI") or
+    os.getenv("mongodb_uri")
+)
 
 client = AsyncIOMotorClient(MONGO_URL)
 
